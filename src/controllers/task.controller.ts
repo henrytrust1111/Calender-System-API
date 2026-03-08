@@ -273,8 +273,6 @@ export const bulkReorderTasks = async (
   res: Response<ApiResponse<null>>,
   next: NextFunction
 ): Promise<void> => {
-  const session = await mongoose.startSession();
-
   try {
     const parsed = reorderSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -292,59 +290,61 @@ export const bulkReorderTasks = async (
       throw new ApiError(400, "One or more task ids are invalid");
     }
 
-    await session.withTransaction(async () => {
-      const existingTasks = await TaskModel.find({ _id: { $in: ids } }).session(session);
-      if (existingTasks.length !== ids.length) {
-        throw new ApiError(404, "One or more tasks not found");
-      }
+    const existingTasks = await TaskModel.find({ _id: { $in: ids } });
+    if (existingTasks.length !== ids.length) {
+      throw new ApiError(404, "One or more tasks not found");
+    }
 
-      const dates = new Set(existingTasks.map((task) => task.date));
-      if (dates.size !== 1) {
-        throw new ApiError(400, "Bulk reorder only supports tasks within the same day");
-      }
+    const dates = new Set(existingTasks.map((task) => task.date));
+    if (dates.size !== 1) {
+      throw new ApiError(400, "Bulk reorder only supports tasks within the same day");
+    }
 
-      const targetDate = existingTasks[0].date;
-      const touchedOrders = tasks.map((item) => item.order);
-      if (new Set(touchedOrders).size !== touchedOrders.length) {
-        throw new ApiError(400, "Duplicate order values in payload are not allowed");
-      }
+    const targetDate = existingTasks[0].date;
+    const touchedOrders = tasks.map((item) => item.order);
+    if (new Set(touchedOrders).size !== touchedOrders.length) {
+      throw new ApiError(400, "Duplicate order values in payload are not allowed");
+    }
 
-      const allDayTasks = await TaskModel.find({ date: targetDate }).session(session);
-      const highestOrder = allDayTasks.length > 0 ? Math.max(...allDayTasks.map((task) => task.order)) : 0;
+    const allDayTasks = await TaskModel.find({ date: targetDate });
+    const highestOrder = allDayTasks.length > 0 ? Math.max(...allDayTasks.map((task) => task.order)) : 0;
 
-      // Phase 1: move updated tasks to a temporary high-order window to avoid collisions.
-      await TaskModel.bulkWrite(
-        tasks.map((item, index) => ({
-          updateOne: {
-            filter: { _id: item.id, date: targetDate },
-            update: { $set: { order: highestOrder + index + 1 } }
-          }
-        })),
-        { session }
-      );
+    // Phase 1: move updated tasks to a temporary high-order window to avoid collisions.
+    await TaskModel.bulkWrite(
+      tasks.map((item, index) => ({
+        updateOne: {
+          filter: { _id: item.id, date: targetDate },
+          update: { $set: { order: highestOrder + index + 1 } }
+        }
+      }))
+    );
 
-      // Phase 2: assign requested order values.
-      await TaskModel.bulkWrite(
-        tasks.map((item) => ({
-          updateOne: {
-            filter: { _id: item.id, date: targetDate },
-            update: { $set: { order: item.order } }
-          }
-        })),
-        { session }
-      );
+    // Phase 2: assign requested order values.
+    await TaskModel.bulkWrite(
+      tasks.map((item) => ({
+        updateOne: {
+          filter: { _id: item.id, date: targetDate },
+          update: { $set: { order: item.order } }
+        }
+      }))
+    );
 
-      await normalizeDateOrders(targetDate, session);
-    });
+    await normalizeDateOrders(targetDate);
 
     res.status(200).json({
       success: true,
       message: "Tasks reordered successfully",
-      data: null
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          data: null
     });
   } catch (error) {
+    if (
+      error instanceof mongoose.Error &&
+      "code" in error &&
+      (error as mongoose.Error & { code?: number }).code === 11000
+    ) {
+      next(new ApiError(409, "Duplicate order conflict detected; please retry operation"));
+      return;
+    }
     next(error);
-  } finally {
-    await session.endSession();
   }
 };
